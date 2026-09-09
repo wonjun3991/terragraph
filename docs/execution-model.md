@@ -423,6 +423,12 @@ bindings. Review JSON exposes independent conditions through `review.contracts`.
 Known null is reconstructed only from the same successful plan, never from a
 missing live output. See the contracts reference for restart and recovery limits.
 
+### Per-node deadlines
+
+`--node-timeout 5m` on plan/apply/destroy limits each node action independently; 0 (the default) disables it. The deadline begins after dispatch and includes input resolution, init, planning, mutation, and output collection. Queue time, graph/runtime preflight, and lock acquisition are excluded. Saved frontier planning and `apply --plan` use the same per-node boundary and keep their existing membership, policy, and recovery rules. Apply and destroy require `--auto-approve` when deadlines are enabled.
+
+A deadline does not establish whether infrastructure changed. The existing journal records observed outcomes and retains indeterminate mutations for explicit recovery; timeout never retries a mutation. Successfully completed actions retain their success even if cancellation arrives at the completion boundary. Subprocess cleanup can extend elapsed time beyond the deadline: Unix waits for its process group and Windows assigns timed runtimes to a non-breakaway job before they execute, then waits for tracked processes to terminate before releasing the action slot or graph lock.
+
 ## Plugin lifecycle outcomes
 
 Plugin gates participate before mutation admission and cannot bypass core approval. Plan gates inspect the same plan bytes and are rechecked after approval; saved plans bind the selected plugin packages, configuration, input values, and authenticated target identities. Required observer failures are recorded separately from node infrastructure phases, so an applied node is not relabelled as an uncertain mutation solely because delivery failed. Unresolved external effects and credential cleanup require [plugin recovery](plugins.md#reports-and-recovery) before their barrier can be cleared. Plugin records use schema version 2, with version 1 retained for plugin-free records.
