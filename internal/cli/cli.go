@@ -285,6 +285,7 @@ func newPlanCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf fun
 	var save bool
 	var continueID string
 	var parallelism int
+	var poolSpecs []string
 	cmd := &cobra.Command{
 		Use:   "plan",
 		Short: "Review node plans, actions, approval policy, and evidence limitations",
@@ -329,6 +330,10 @@ func newPlanCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf fun
 			e.Stdout = cmd.ErrOrStderr()
 			phase = "prepare"
 			opts := selection.options(cmd, output, &scope)
+			opts.Pools, err = parsePools(poolSpecs)
+			if err != nil {
+				return err
+			}
 			opts.Parallelism, opts.Approve = parallelism, policy
 			if save {
 				savedRecord, err = e.SavePlans(opts, continueID)
@@ -339,6 +344,7 @@ func newPlanCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf fun
 		},
 	}
 	selection.add(cmd)
+	cmd.Flags().StringArrayVar(&poolSpecs, "pool", nil, "shared limit as name=limit:node,node (repeatable; nodes may belong to several pools)")
 	cmd.Flags().IntVar(&parallelism, "parallelism", 1, "max ready nodes to run concurrently")
 	cmd.Flags().StringVar(&output, "output", "text", "output format: text or json")
 	cmd.Flags().BoolVar(&save, "save", false, "save only the ready graph frontier for a later apply --plan")
@@ -354,6 +360,7 @@ func newApplyCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf fu
 	var retainPlan bool
 	var autoApprove bool
 	var parallelism int
+	var poolSpecs []string
 	var force bool
 	var approve string
 	var output string
@@ -390,6 +397,10 @@ func newApplyCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf fu
 			}
 			var scope *selectionDTO
 			opts := selection.options(cmd, output, &scope)
+			opts.Pools, err = parsePools(poolSpecs)
+			if err != nil {
+				return err
+			}
 			opts.AutoApprove, opts.Approve, opts.Parallelism, opts.RetainPlan = autoApprove, level, parallelism, retainPlan
 			var runs engine.RunResult
 			if planID != "" {
@@ -404,6 +415,7 @@ func newApplyCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf fu
 		},
 	}
 	selection.add(cmd)
+	cmd.Flags().StringArrayVar(&poolSpecs, "pool", nil, "shared limit as name=limit:node,node (repeatable; nodes may belong to several pools)")
 	cmd.Flags().StringVar(&planID, "plan", "", "apply the stored frontier of a saved execution without replanning")
 	cmd.Flags().BoolVar(&retainPlan, "retain-plan", false, "retain optional plan artifacts while ordinary apply continues")
 	cmd.Flags().BoolVar(&autoApprove, "auto-approve", false, "skip the interactive approval prompt")
@@ -420,6 +432,7 @@ func newDestroyCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf 
 	var selection selectionFlags
 	var autoApprove bool
 	var parallelism int
+	var poolSpecs []string
 	var output string
 	cmd := &cobra.Command{
 		Use:   "destroy",
@@ -447,12 +460,17 @@ func newDestroyCmd(blueprintPath *string, binaryOf func() exec.Binary, loggerOf 
 			}
 			var scope *selectionDTO
 			opts := selection.options(cmd, output, &scope)
+			opts.Pools, err = parsePools(poolSpecs)
+			if err != nil {
+				return err
+			}
 			opts.AutoApprove, opts.Parallelism = autoApprove, parallelism
 			runs, err := e.Destroy(opts)
 			return finishRun(cmd, output, runs, err, scope)
 		},
 	}
 	selection.add(cmd)
+	cmd.Flags().StringArrayVar(&poolSpecs, "pool", nil, "shared limit as name=limit:node,node (repeatable; nodes may belong to several pools)")
 	cmd.Flags().BoolVar(&autoApprove, "auto-approve", false, "skip interactive approval")
 	cmd.Flags().IntVar(&parallelism, "parallelism", 1, "max ready nodes to run concurrently")
 	cmd.Flags().StringVar(&output, "output", "text", "output format: text or json")
