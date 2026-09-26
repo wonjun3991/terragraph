@@ -1,6 +1,7 @@
 package plugins_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -131,7 +132,7 @@ func runLifecycleTerraform() {
 		}
 	}
 	// Holding one node's apply until another node's command appears proves overlap without timing assumptions; an unmet wait fails instead of hanging.
-	if waiter, target, ok := strings.Cut(os.Getenv("TG_LIFECYCLE_WAIT"), ":"); ok && waiter == node && args[0] == "apply" {
+	if waiter, target, ok := strings.Cut(os.Getenv("TG_LIFECYCLE_WAIT"), ":"); ok && waiter == node && args[0] == cmp.Or(os.Getenv("TG_LIFECYCLE_WAIT_COMMAND"), "apply") {
 		watched, want := path, " "+target+"\n"
 		// Waiting on the observer's event log instead holds a node until another node's lifecycle delivery has happened.
 		if events := os.Getenv("TG_LIFECYCLE_WAIT_IN"); events != "" {
@@ -940,5 +941,48 @@ func TestLifecycle_ReviewBlockedNodeFinishesBeforeItsLevel(t *testing.T) {
 	finished, level := eventIndex(lines, "node.finished|child|not run|"), eventIndex(lines, "level.finished|||child")
 	if eventCount(lines, "node.finished|child|") != 1 || finished < 0 || level < finished {
 		t.Fatalf("got = %v, want blocked child's terminal event before its level", lines)
+	}
+}
+
+func TestLifecycle_ReviewDeliveryFailureStopsLaterLevelInSameScan(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", fail_terminal = "node.finished", fail_operation = "plan", fail_node = "child" }
+ feature "delivery" { mode = "enforce" }`, `node "a" { source = "./module" }
+ node "b" { source = "./module" }
+ node "p" { source = "./module" }
+ node "aa" { source = "./module" }
+ node "child" { source = "./module" }
+ node "tail" { source = "./module" }
+ edge {
+ from = node.p
+ to = node.aa
+ }
+ edge {
+ from = node.a
+ to = node.child
+ }
+ edge {
+ from = node.aa
+ to = node.tail
+ }`)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	t.Setenv("TG_LIFECYCLE_FAIL_PLAN", "a")
+	// b holds one slot until blocked child's failed delivery, so the scan that closes child still has a free slot for tail.
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:node.finished|child|")
+	t.Setenv("TG_LIFECYCLE_WAIT_IN", events)
+	t.Setenv("TG_LIFECYCLE_WAIT_COMMAND", "plan")
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.ReviewPlan(engine.Options{Parallelism: 2}, false)
+	if err == nil || !strings.Contains(err.Error(), "at node.finished") {
+		t.Fatalf("got = %v, want required node.finished delivery failure", err)
+	}
+	for _, n := range result.Nodes {
+		if n.Node == "tail" && n.Status != engine.StatusNotRun {
+			t.Fatalf("got = %+v, want tail beyond the failed delivery level not run", result.Nodes)
+		}
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " tail\n") {
+		t.Fatalf("got = %s, want no work beyond the failed delivery level", commands)
 	}
 }

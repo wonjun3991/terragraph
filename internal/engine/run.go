@@ -182,12 +182,13 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 			}
 			nextLevel++
 		}
-		boundary, closed := min(failureLevel, completionLevel()), false
+		closed := false
 		for i := range runs {
 			if active == opts.parallelism() || stopErr != nil {
 				break
 			}
-			if started[i] || done[i] || runs[i].Level > boundary || (gated && runs[i].Level > nextLevel) {
+			// The boundary is re-read per candidate because closing a blocked node or a running node's delivery can record a failure mid-scan.
+			if started[i] || done[i] || runs[i].Level > min(failureLevel, completionLevel()) || (gated && runs[i].Level > nextLevel) {
 				continue
 			}
 			parents := e.Graph.In[runs[i].Node]
