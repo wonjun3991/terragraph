@@ -92,9 +92,9 @@ type selectionFlags struct {
 }
 
 func (f *selectionFlags) add(cmd *cobra.Command) {
-	cmd.Flags().BoolVar(&f.upstream, "upstream", false, "include all predecessors of --node across data and ordering edges (exclusive with --downstream)")
 	cmd.Flags().StringArrayVar(&f.nodes, "node", nil, "select an exact leaf name (repeat for multiple nodes; commas are literal)")
 	cmd.Flags().BoolVar(&f.downstream, "downstream", false, "include all successors of --node across data and ordering edges")
+	cmd.Flags().BoolVar(&f.upstream, "upstream", false, "include all predecessors of --node across data and ordering edges (exclusive with --downstream)")
 }
 
 func (f *selectionFlags) specified(cmd *cobra.Command) bool {
