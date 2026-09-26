@@ -6,12 +6,14 @@ import "fmt"
 type ConcurrencyPool struct {
 	Name  string
 	Limit int
+	// Nodes are expanded leaf names; a group name would silently leave its leaves unbounded, so validation rejects anything not in the graph.
 	Nodes []string
 }
 
+// validatePools rejects malformed pools before any lock or runtime work so a typo cannot quietly run the service unbounded.
 func (e *Engine) validatePools(opts Options) error {
 	fail := func(err error) error {
-		return WithDiagnostic(err, Diagnostic{Code: "invalid_arguments", Category: "arguments", Phase: "selection", Subject: "pool"})
+		return WithDiagnostic(err, Diagnostic{Code: "invalid_arguments", Category: "arguments", Phase: "selection", Subject: "pool", Remedy: "list each expanded leaf from graph output once per pool, with a unique name and a positive limit"})
 	}
 	names := map[string]bool{}
 	for _, pool := range opts.Pools {

@@ -244,3 +244,14 @@ func TestApply_PoolCannotSilentlyReferenceUnknownLeaf(t *testing.T) {
 		t.Fatalf("got = %v, want invalid pool rejected before runtime", err)
 	}
 }
+
+func TestApplySavedPlans_RejectsPoolsBeforeLoadingRecord(t *testing.T) {
+	e := dagFixture(t)
+	pools := []ConcurrencyPool{{Name: "api", Limit: 1, Nodes: []string{"a"}}}
+	if _, err := e.SavePlans(Options{Pools: pools}, ""); err == nil || !strings.Contains(err.Error(), "omit it for saved execution commands") {
+		t.Fatalf("save got = %v, want --pool rejected for saved frontiers", err)
+	}
+	if _, err := e.ApplySavedPlans("missing", Options{Pools: pools}); err == nil || !strings.Contains(err.Error(), "omit it for saved execution commands") {
+		t.Fatalf("apply got = %v, want --pool rejected before the record lookup", err)
+	}
+}

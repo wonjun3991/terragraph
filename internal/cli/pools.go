@@ -16,7 +16,7 @@ func parsePools(specs []string) ([]engine.ConcurrencyPool, error) {
 		count, members, found := strings.Cut(raw, ":")
 		limit, err := strconv.Atoi(count)
 		if !ok || !found || name == "" || members == "" || err != nil || limit < 1 {
-			return nil, engine.WithDiagnostic(fmt.Errorf("--pool %q: use name=positive-limit:node,node", spec), engine.Diagnostic{Code: "invalid_arguments", Category: "arguments", Phase: "arguments", Subject: "pool"})
+			return nil, engine.WithDiagnostic(fmt.Errorf("--pool %q: use name=positive-limit:node,node", spec), engine.Diagnostic{Code: "invalid_arguments", Category: "arguments", Phase: "arguments", Subject: "pool", Remedy: "pass --pool name=limit:node,node with a positive integer limit"})
 		}
 		pools = append(pools, engine.ConcurrencyPool{Name: name, Limit: limit, Nodes: strings.Split(members, ",")})
 	}

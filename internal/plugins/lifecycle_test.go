@@ -999,3 +999,81 @@ func TestLifecycle_ReviewDeliveryFailureStopsLaterLevelInSameScan(t *testing.T) 
 		t.Fatalf("got = %s, want no work beyond the failed delivery level", commands)
 	}
 }
+
+func TestLifecycle_PrepareDenialReleasesPoolSlot(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", deny_phase = "node.prepare", deny_node = "a" }`, crossLevelNodes)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2, Pools: []engine.ConcurrencyPool{{Name: "api", Limit: 1, Nodes: []string{"a", "b"}}}})
+	if err == nil || !strings.Contains(err.Error(), "policy denied node.prepare") {
+		t.Fatalf("got = %v, want node.prepare denial", err)
+	}
+	// b can only start after a's denied prepare returns the single slot; a leaked slot leaves b not run.
+	want := map[string]string{"a": engine.StatusNotRun, "b": engine.StatusApplied, "child": engine.StatusNotRun, "tail": engine.StatusNotRun}
+	for _, n := range result.Nodes {
+		if n.Status != want[n.Node] {
+			t.Fatalf("got = %+v, want b applied after a released its pool slot", result.Nodes)
+		}
+	}
+	lines := lifecycleEvents(t, events)
+	for _, node := range []string{"a", "b", "child", "tail"} {
+		if eventCount(lines, "node.finished|"+node+"|") != 1 {
+			t.Fatalf("got = %v, want one terminal event for %s", lines, node)
+		}
+	}
+}
+
+func TestLifecycle_CancellationReportsPoolBlockedNodeOnce(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, crossLevelNodes)
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", filepath.Join(dir, "runtime.log"))
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:never")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("TG_LIFECYCLE_RELEASE", release)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.Context = ctx
+	type outcome struct {
+		result engine.RunResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2, Pools: []engine.ConcurrencyPool{{Name: "api", Limit: 1, Nodes: []string{"b", "child"}}}})
+		done <- outcome{result, err}
+	}()
+	// Waiting for a's event or the run's end instead of a wall-clock budget: b never finishes, so a run that ends first means a did not overlap the pool holder.
+	var got outcome
+	for eventIndex(lifecycleEvents(t, events), "node.finished|a|applied|") < 0 {
+		select {
+		case got = <-done:
+			t.Fatalf("got = %+v / %v, want a finished while pool holder b was still running", got.result.Nodes, got.err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got = <-done:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("cancelled apply with a pool-blocked node did not return")
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("got = %v, want cancellation", got.err)
+	}
+	lines := lifecycleEvents(t, events)
+	// child was ready once a finished but b held the only slot, so it must be reported without ever being prepared.
+	if eventCount(lines, "node.prepare|child|") != 0 || eventCount(lines, "node.finished|child|not run|") != 1 {
+		t.Fatalf("got = %v, want pool-blocked child never prepared and reported not run once", lines)
+	}
+	for _, node := range []string{"a", "b", "child", "tail"} {
+		if eventCount(lines, "node.finished|"+node+"|") != 1 {
+			t.Fatalf("got = %v, want one terminal event for %s", lines, node)
+		}
+	}
+}

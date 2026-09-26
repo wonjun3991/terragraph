@@ -238,6 +238,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 			if !ready {
 				continue
 			}
+			// Slots are taken by the coordinator only once gates and prerequisites allow dispatch and are returned when the completion arrives, so prepare denial, failure, and cancellation all release them and a pool-blocked node never started still gets its deferred terminal event.
 			for _, pi := range poolFor[runs[i].Node] {
 				if poolUse[pi] >= opts.Pools[pi].Limit {
 					ready = false
