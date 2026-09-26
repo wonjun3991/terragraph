@@ -41,7 +41,7 @@ Boundary edges preserve their original direction. Incoming data edges explain ex
 
 ### Partial destroy protection
 
-A selected `destroy` refuses to remove a producer if any declared transitive consumer is outside the selection. Both data and ordering edges count. Inspect the boundary using `graph --node <leaf>` and include consumers with `destroy --node <leaf> --downstream`. To intentionally leave them behind, pass `--allow-orphan-destroy`; this acknowledges scope only and does not bypass node approval policy, interactive confirmation, runtime checks, or execution recovery. The default whole-graph destroy is unchanged. The check runs before runtime calls or a new execution record and reports `incomplete_destroy_scope` through the existing structured diagnostics. It does not inspect Terraform state or discover undeclared consumers.
+A selected `destroy` refuses to remove a producer if any declared transitive consumer is outside the selection. Both data and ordering edges count. `graph --node <leaf> --downstream` lists every consumer a complete teardown needs; include them with `destroy --node <leaf> --downstream` or additional `--node` flags. To intentionally leave them behind, pass `--allow-orphan-destroy`; this acknowledges scope only and does not bypass node approval policy, interactive confirmation, runtime checks, or execution recovery. The default whole-graph destroy is unchanged. The check runs before runtime calls or a new execution record and reports `incomplete_destroy_scope` through the existing structured diagnostics. It does not inspect Terraform state or discover undeclared consumers.
 
 ### Selection output and compatibility
 
