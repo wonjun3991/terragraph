@@ -138,7 +138,8 @@ func runLifecycleTerraform() {
 		if events := os.Getenv("TG_LIFECYCLE_WAIT_IN"); events != "" {
 			watched, want = events, target
 		}
-		deadline := time.Now().Add(20 * time.Second)
+		// Generous because a race-instrumented Windows runner can take seconds per fixture subprocess; only a real scheduling barrier reaches it.
+		deadline := time.Now().Add(2 * time.Minute)
 		for {
 			commands, _ := os.ReadFile(watched)
 			if strings.Contains(string(commands), want) {
@@ -865,18 +866,19 @@ func TestLifecycle_CancellationReportsEveryNodeOnce(t *testing.T) {
 		result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2})
 		done <- outcome{result, err}
 	}()
-	deadline := time.Now().Add(15 * time.Second)
+	// Waiting for the child's event or the run's end instead of a wall-clock budget: b holds its slot, so a run that ends first means child never overlapped it.
+	var got outcome
 	for eventIndex(lifecycleEvents(t, events), "node.finished|child|applied|") < 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("level-2 child never finished beside the running level-1 node")
+		select {
+		case got = <-done:
+			t.Fatalf("got = %+v / %v, want level-2 child finished while level-1 b was still running", got.result.Nodes, got.err)
+		case <-time.After(10 * time.Millisecond):
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
-	var got outcome
 	select {
 	case got = <-done:
-	case <-time.After(30 * time.Second):
+	case <-time.After(2 * time.Minute):
 		t.Fatal("cancelled apply did not return")
 	}
 	if !errors.Is(got.err, context.Canceled) {
