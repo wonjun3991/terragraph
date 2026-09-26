@@ -999,3 +999,115 @@ func TestLifecycle_ReviewDeliveryFailureStopsLaterLevelInSameScan(t *testing.T) 
 		t.Fatalf("got = %s, want no work beyond the failed delivery level", commands)
 	}
 }
+
+func TestLifecycle_ContinueReportsBlockedDependentBeforeItsLevel(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", deny_phase = "node.prepare", deny_node = "child" }`, crossLevelNodes+`
+ node "last" { source = "./module" }
+ node "after" { source = "./module" }
+ edge {
+ from = node.child
+ to = node.last
+ }
+ edge {
+ from = node.tail
+ to = node.after
+ }`)
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", filepath.Join(dir, "runtime.log"))
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Apply(engine.Options{AutoApprove: true, FailurePolicy: "continue"})
+	if err == nil || !strings.Contains(err.Error(), "policy denied node.prepare") {
+		t.Fatalf("got = %v, want node.prepare denial", err)
+	}
+	want := map[string]string{"a": engine.StatusApplied, "b": engine.StatusApplied, "child": engine.StatusNotRun, "tail": engine.StatusApplied, "last": engine.StatusNotRun, "after": engine.StatusApplied}
+	for _, n := range result.Nodes {
+		if n.Status != want[n.Node] {
+			t.Fatalf("got = %+v, want independent branch applied past the denial", result.Nodes)
+		}
+		if n.Node == "last" && (len(n.Diagnostics) != 1 || n.Diagnostics[0].Code != "dependency_not_reached") {
+			t.Fatalf("got = %+v, want blocked dependent reported as dependency_not_reached", n.Diagnostics)
+		}
+	}
+	lines := lifecycleEvents(t, events)
+	if eventCount(lines, "node.finished|last|") != 1 || eventCount(lines, "node.finished|last|not run|") != 1 {
+		t.Fatalf("got = %v, want exactly one not-run terminal event for the blocked dependent", lines)
+	}
+	third := eventIndex(lines, "level.finished|||after,last")
+	if eventCount(lines, "level.finished|") != 3 || third < 0 || eventIndex(lines, "node.finished|last|") > third {
+		t.Fatalf("got = %v, want every level reported after its blocked node finished", lines)
+	}
+}
+
+func TestLifecycle_ContinueUnderLevelGateReachesBlockedChain(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", deny_phase = "node.prepare", deny_node = "last" }`, `node "a" { source = "./module" }
+ node "child" { source = "./module" }
+ node "last" { source = "./module" }
+ edge {
+ from = node.a
+ to = node.child
+ }
+ edge {
+ from = node.child
+ to = node.last
+ }`)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Destroy(engine.Options{AutoApprove: true, FailurePolicy: "continue"})
+	if err == nil || !strings.Contains(err.Error(), "policy denied node.prepare") {
+		t.Fatalf("got = %v, want node.prepare denial", err)
+	}
+	// With the level gate barrier active, nothing is running once child is blocked, so a is reached only if blocking alone advances the schedule.
+	for _, n := range result.Nodes {
+		if n.Status != engine.StatusNotRun || (n.Node != "last" && (len(n.Diagnostics) != 1 || n.Diagnostics[0].Code != "dependency_not_reached")) {
+			t.Fatalf("got = %+v, want every producer blocked with dependency_not_reached", result.Nodes)
+		}
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), "destroy") {
+		t.Fatalf("got = %s, want no producer destroyed", commands)
+	}
+	if lines := lifecycleEvents(t, events); eventCount(lines, "level.finished|") != 3 {
+		t.Fatalf("got = %v, want each gated level decided", lines)
+	}
+}
+
+func TestLifecycle_ContinueCannotOverrideLevelGateDenial(t *testing.T) {
+	dir, binary := lifecycleFixture(t, `config = { deny_phase = "level.finished" }`, `node "a" { source = "./module" }
+ node "b" { source = "./module" }
+ node "child" { source = "./module" }
+ edge {
+ from = node.a
+ to = node.child
+ }`)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Destroy(engine.Options{AutoApprove: true, Parallelism: 2, FailurePolicy: "continue"})
+	if err == nil || !strings.Contains(err.Error(), "policy denied level.finished") {
+		t.Fatalf("got = %v, want level gate denial", err)
+	}
+	for _, n := range result.Nodes {
+		if (n.Node == "child") != (n.Status == engine.StatusDestroyed) {
+			t.Fatalf("got = %+v, want only the gated level destroyed", result.Nodes)
+		}
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " b\n") || strings.Contains(string(commands), " a\n") {
+		t.Fatalf("got = %s, want no work beyond the denied level", commands)
+	}
+}
+
+func TestLifecycle_ContinueCannotOverrideRequiredDeliveryFailure(t *testing.T) {
+	dir, binary := lifecycleFixture(t, `config = { fail_terminal = "level.finished", fail_operation = "apply" }
+ feature "delivery" { mode = "enforce" }`, crossLevelNodes)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	_, err := e.Apply(engine.Options{AutoApprove: true, FailurePolicy: "continue"})
+	if err == nil || !strings.Contains(err.Error(), "at level.finished") {
+		t.Fatalf("got = %v, want required level delivery failure", err)
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " child\n") || strings.Contains(string(commands), " tail\n") {
+		t.Fatalf("got = %s, want no later-level work after the failed delivery", commands)
+	}
+}

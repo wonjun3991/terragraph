@@ -124,7 +124,7 @@ func TestRunLevels_ReviewPreservesDependencyDiagnostics(t *testing.T) {
 	if !errors.Is(err, failure) {
 		t.Fatalf("error = %v, want %v", err, failure)
 	}
-	if runs[2].Status != StatusNotRun || !errors.Is(runs[2].Err, errPlanBlocked) || len(runs[2].Diagnostics) != 1 || runs[3].Status != StatusPlanned {
+	if runs[2].Status != StatusNotRun || !errors.Is(runs[2].Err, errDependencyNotReached) || len(runs[2].Diagnostics) != 1 || runs[3].Status != StatusPlanned {
 		t.Fatalf("runs = %+v, want blocked diagnostic and successful independent branch", runs)
 	}
 }
@@ -243,5 +243,26 @@ func TestSavedExecution_FailurePolicyCannotOverrideRecovery(t *testing.T) {
 	}
 	if _, err := e.ApplySavedPlans("run-missing", Options{FailurePolicy: "stop"}); err == nil || !strings.Contains(err.Error(), "saved frontiers") {
 		t.Fatalf("got = %v, want unsupported saved policy rejected before storage", err)
+	}
+}
+
+func TestRunLevels_ContinueReportsBlockedApplyAsScheduleSkip(t *testing.T) {
+	e := dagFixture(t)
+	failure := errors.New("apply failed")
+	runs, err := e.runLevels(Options{FailurePolicy: "continue"}, false, func(name string, _ map[string]exec.Outputs, _ io.Writer) (exec.Outputs, string, error) {
+		if name == "a" {
+			return nil, "", failure
+		}
+		return nil, StatusApplied, nil
+	}, nil)
+	if !errors.Is(err, failure) || runs[3].Status != StatusApplied {
+		t.Fatalf("got = %+v, %v, want independent branch applied", runs, err)
+	}
+	child := runs[2]
+	if child.Node != "child" || child.Status != StatusNotRun || len(child.Diagnostics) != 1 {
+		t.Fatalf("got = %+v, want one diagnostic on blocked child", child)
+	}
+	if got := child.Diagnostics[0]; got.Code != "dependency_not_reached" || got.Phase != "schedule" || got.Remedy == "" || strings.Contains(got.Message, "plan evidence") {
+		t.Fatalf("got = %+v, want a schedule skip with a remedy, not a runtime failure", got)
 	}
 }

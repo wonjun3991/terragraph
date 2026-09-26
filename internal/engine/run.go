@@ -144,7 +144,12 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 		done[i] = true
 		runs[i].Status, runs[i].Err = status, nodeErr
 		if nodeErr != nil {
-			runs[i].Diagnostics = Diagnostics(nodeErr, Diagnostic{Code: "runtime_failed", Category: "runtime", Phase: "execute", Subject: "node." + runs[i].Node})
+			fallback := Diagnostic{Code: "runtime_failed", Category: "runtime", Phase: "execute", Subject: "node." + runs[i].Node}
+			// A schedule skip must not read as a node runtime failure to callers branching on code.
+			if errors.Is(nodeErr, errDependencyNotReached) {
+				fallback.Code, fallback.Phase, fallback.Remedy = "dependency_not_reached", "schedule", "resolve the failed dependency's diagnostic and rerun; this node starts once it succeeds"
+			}
+			runs[i].Diagnostics = Diagnostics(nodeErr, fallback)
 			if !keepGoing && runs[i].Level < failureLevel {
 				failureLevel = runs[i].Level
 				if opts.FailurePolicy == "stop" {
@@ -229,7 +234,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 						}
 						cancel()
 					}
-					finish(i, StatusNotRun, fmt.Errorf("%w: dependency %s has no successful plan evidence; resolve its diagnostic first", errPlanBlocked, blocked))
+					finish(i, StatusNotRun, fmt.Errorf("%w: dependency %s did not succeed; resolve its diagnostic first", errDependencyNotReached, blocked))
 					closed = true
 				}
 				continue
@@ -309,7 +314,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 	return runs, nil
 }
 
-var errPlanBlocked = errors.New("plan not reached")
+var errDependencyNotReached = errors.New("not started")
 
 // resolveSelection freezes membership before runtime checks and keeps every scheduler on the same filtered levels.
 func (e *Engine) resolveSelection(opts Options) (Options, error) {
