@@ -66,7 +66,7 @@ func serveLifecycleFixture() {
 					panic("private plugin error")
 				}
 			}
-			if r.Feature == "delivery" && ((config["fail_delivery"] == true && r.Event.Phase == "node.mutation.finished") || (config["fail_terminal"] == r.Event.Phase && config["fail_operation"] == r.Event.Operation)) {
+			if r.Feature == "delivery" && ((config["fail_delivery"] == true && r.Event.Phase == "node.mutation.finished") || (config["fail_terminal"] == r.Event.Phase && config["fail_operation"] == r.Event.Operation && (config["fail_node"] == nil || config["fail_node"] == r.Event.Node))) {
 				return sdk.Response{}, errors.New("private delivery error")
 			}
 			return sdk.Response{}, nil
@@ -132,10 +132,15 @@ func runLifecycleTerraform() {
 	}
 	// Holding one node's apply until another node's command appears proves overlap without timing assumptions; an unmet wait fails instead of hanging.
 	if waiter, target, ok := strings.Cut(os.Getenv("TG_LIFECYCLE_WAIT"), ":"); ok && waiter == node && args[0] == "apply" {
+		watched, want := path, " "+target+"\n"
+		// Waiting on the observer's event log instead holds a node until another node's lifecycle delivery has happened.
+		if events := os.Getenv("TG_LIFECYCLE_WAIT_IN"); events != "" {
+			watched, want = events, target
+		}
 		deadline := time.Now().Add(20 * time.Second)
 		for {
-			commands, _ := os.ReadFile(path)
-			if strings.Contains(string(commands), " "+target+"\n") {
+			commands, _ := os.ReadFile(watched)
+			if strings.Contains(string(commands), want) {
 				break
 			}
 			if time.Now().After(deadline) {
@@ -150,6 +155,9 @@ func runLifecycleTerraform() {
 	case "version":
 		fmt.Print(`{"terraform_version":"1.5.7","platform":"test","provider_selections":{}}`)
 	case "plan":
+		if os.Getenv("TG_LIFECYCLE_FAIL_PLAN") == node {
+			os.Exit(1)
+		}
 		for _, arg := range args {
 			if strings.HasPrefix(arg, "-out=") {
 				if err := os.WriteFile(strings.TrimPrefix(arg, "-out="), []byte("immutable-native-plan"), 0600); err != nil {
@@ -886,5 +894,51 @@ func TestLifecycle_CancellationReportsEveryNodeOnce(t *testing.T) {
 	}
 	if eventCount(lines, "node.finished|tail|not run|") != 1 || eventCount(lines, "level.finished|") != 0 || eventCount(lines, "run.finished||cancelled|") != 1 {
 		t.Fatalf("got = %v, want not-run tail, no level completion, and a cancelled run", lines)
+	}
+}
+
+func TestLifecycle_LaterDeliveryFailureKeepsEarlierLevelNotice(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", fail_terminal = "node.finished", fail_operation = "apply", fail_node = "child" }
+ feature "delivery" { mode = "enforce" }`, crossLevelNodes)
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", filepath.Join(dir, "runtime.log"))
+	// b finishes level 1 only after level-2 child's required node.finished delivery has failed.
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:node.finished|child|")
+	t.Setenv("TG_LIFECYCLE_WAIT_IN", events)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	_, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2})
+	if err == nil || !strings.Contains(err.Error(), "at node.finished") {
+		t.Fatalf("got = %v, want required node.finished delivery failure", err)
+	}
+	lines := lifecycleEvents(t, events)
+	if eventCount(lines, "level.finished|||a,b") != 1 || eventCount(lines, "level.finished|||child,tail") != 0 {
+		t.Fatalf("got = %v, want the clean earlier level reported and the failed level withheld", lines)
+	}
+}
+
+func TestLifecycle_ReviewBlockedNodeFinishesBeforeItsLevel(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, `node "a" { source = "./module" }
+ node "b" { source = "./module" }
+ node "child" { source = "./module" }
+ edge {
+ from = node.a
+ to = node.child
+ }`)
+	t.Setenv("TG_LIFECYCLE_FAIL_PLAN", "a")
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.ReviewPlan(engine.Options{}, false)
+	if err == nil {
+		t.Fatal("failed plan accepted")
+	}
+	for _, n := range result.Nodes {
+		if n.Node == "b" && n.Status != engine.StatusPlanned {
+			t.Fatalf("got = %+v, want independent b planned", result.Nodes)
+		}
+	}
+	lines := lifecycleEvents(t, events)
+	finished, level := eventIndex(lines, "node.finished|child|not run|"), eventIndex(lines, "level.finished|||child")
+	if eventCount(lines, "node.finished|child|") != 1 || finished < 0 || level < finished {
+		t.Fatalf("got = %v, want blocked child's terminal event before its level", lines)
 	}
 }

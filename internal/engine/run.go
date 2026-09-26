@@ -113,7 +113,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 		defer cancel()
 		for _, run := range runs {
 			if emitErr := e.plugins.Emit(ctx, sdk.Event{Phase: "node.finished", Node: run.Node, Status: run.Status}); emitErr != nil {
-				e.plugins.AddCompletionError(emitErr)
+				e.plugins.AddNodeCompletionError(run.Node, emitErr)
 			}
 		}
 	}()
@@ -128,7 +128,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 		buffer  *bytes.Buffer
 	}
 	completed := make(chan completion, opts.parallelism())
-	active, failureLevel, nextLevel := 0, len(levels)+1, 1
+	active, failureLevel, nextLevel, unattributedLevel := 0, len(levels)+1, 1, len(levels)+1
 	// A level.finished gate may deny work beyond that level, so its decision must precede any later dispatch; observers and plugin-free runs keep levels overlapping.
 	gated := afterLevel != nil || e.plugins.Has("level.finished")
 	var stopErr error
@@ -141,6 +141,20 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 				failureLevel = runs[i].Level
 			}
 		}
+	}
+	// A postcondition failure stops work beyond its node's level and withholds that level's notification, while earlier completed levels still report; a failure with no node is pinned to the level whose completion revealed it.
+	completionLevel := func() int {
+		level := len(levels) + 1
+		nodes, unattributed := e.plugins.CompletionFailures()
+		if unattributed {
+			level = unattributedLevel
+		}
+		for _, node := range nodes {
+			if i, selected := indices[node]; selected && runs[i].Level < level {
+				level = runs[i].Level
+			}
+		}
+		return level
 	}
 	levelDone := func(level int) bool {
 		for _, name := range levels[level-1] {
@@ -155,7 +169,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 			stopErr = cancelled
 		}
 		// level.finished follows every node.finished of its level and keeps level order even when an overlapping later level completed first; a failed level still reports, levels beyond the boundary never do.
-		for stopErr == nil && e.plugins.CompletionError() == nil && nextLevel <= len(levels) && nextLevel <= failureLevel && levelDone(nextLevel) {
+		for stopErr == nil && nextLevel <= len(levels) && nextLevel <= failureLevel && nextLevel < completionLevel() && levelDone(nextLevel) {
 			if emitErr := e.plugins.Emit(e.context(), sdk.Event{Phase: "level.finished", Nodes: levels[nextLevel-1]}); emitErr != nil {
 				stopErr = emitErr
 				break
@@ -168,11 +182,12 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 			}
 			nextLevel++
 		}
+		boundary, closed := min(failureLevel, completionLevel()), false
 		for i := range runs {
 			if active == opts.parallelism() || stopErr != nil {
 				break
 			}
-			if started[i] || done[i] || runs[i].Level > failureLevel || (gated && runs[i].Level > nextLevel) {
+			if started[i] || done[i] || runs[i].Level > boundary || (gated && runs[i].Level > nextLevel) {
 				continue
 			}
 			parents := e.Graph.In[runs[i].Node]
@@ -194,7 +209,16 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 			}
 			if blocked != "" {
 				if keepGoing {
+					// Delivered before the node counts as done so its level's notification can never precede it.
+					if e.plugins != nil {
+						ctx, cancel := context.WithTimeout(context.WithoutCancel(e.context()), 5*time.Second)
+						if emitErr := e.plugins.Emit(ctx, sdk.Event{Phase: "node.finished", Node: runs[i].Node, Status: StatusNotRun}); emitErr != nil {
+							e.plugins.AddNodeCompletionError(runs[i].Node, emitErr)
+						}
+						cancel()
+					}
 					finish(i, StatusNotRun, fmt.Errorf("%w: dependency %s has no successful plan evidence; resolve its diagnostic first", errPlanBlocked, blocked))
+					closed = true
 				}
 				continue
 			}
@@ -232,11 +256,15 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 					emitErr := e.plugins.Emit(ctx, sdk.Event{Phase: "node.finished", Node: name, Status: result.status})
 					cancel()
 					if emitErr != nil {
-						e.plugins.AddCompletionError(emitErr)
+						e.plugins.AddNodeCompletionError(name, emitErr)
 					}
 				}
 				completed <- result
 			}(i, runs[i].Node)
+		}
+		// Closing a blocked node can complete a level, so its notification and any work it releases get another pass before waiting or returning.
+		if closed {
+			continue
 		}
 		if active == 0 {
 			break
@@ -251,9 +279,8 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 		if result.err == nil && result.outputs != nil {
 			applied[runs[result.index].Node] = result.outputs
 		}
-		// A required plugin postcondition failure ends new work the way a node failure at the reporting level would, even during plan review.
-		if e.plugins.CompletionError() != nil && runs[result.index].Level < failureLevel {
-			failureLevel = runs[result.index].Level
+		if _, unattributed := e.plugins.CompletionFailures(); unattributed && runs[result.index].Level < unattributedLevel {
+			unattributedLevel = runs[result.index].Level
 		}
 	}
 	if stopErr != nil {
