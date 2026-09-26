@@ -21,16 +21,11 @@ const runtimeCleanupGrace = 5 * time.Second
 
 // runWithDeadline assigns a suspended runtime to a non-breakaway job before it can spawn providers, so a deadline owns the complete ordinary process tree.
 func runWithDeadline(ctx context.Context, cmd *exec.Cmd) error {
-	job, err := windows.CreateJobObject(nil, nil)
+	job, err := newKillOnCloseJob()
 	if err != nil {
-		return fmt.Errorf("creating runtime job: %w", err)
+		return err
 	}
 	defer func() { _ = windows.CloseHandle(job) }()
-	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-		return fmt.Errorf("protecting runtime job: %w", err)
-	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -45,24 +40,9 @@ func runWithDeadline(ctx context.Context, cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	abort := func(cause error) error {
+	if err := assignAndResume(job, cmd.Process.Pid, ctx.Err); err != nil {
 		_ = cmd.Process.Kill()
-		return waitForRuntime(ctx, cmd, job, runtimeCleanupGrace, cause)
-	}
-	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_SUSPEND_RESUME, false, uint32(cmd.Process.Pid))
-	if err != nil {
-		return abort(fmt.Errorf("opening suspended runtime: %w", err))
-	}
-	defer func() { _ = windows.CloseHandle(process) }()
-	assignErr := windows.AssignProcessToJobObject(job, process)
-	if assignErr != nil {
-		return abort(fmt.Errorf("assigning runtime job: %w; remove incompatible host job restrictions or omit node timeouts", assignErr))
-	}
-	if err := ctx.Err(); err != nil {
-		return abort(err)
-	}
-	if err := resumeRuntime(process); err != nil {
-		return abort(err)
+		return waitForRuntime(ctx, cmd, job, runtimeCleanupGrace, err)
 	}
 	return waitForRuntime(ctx, cmd, job, runtimeCleanupGrace, nil)
 }
@@ -153,19 +133,6 @@ func waitForRuntime(ctx context.Context, cmd *exec.Cmd, job windows.Handle, grac
 			return errors.Join(ctx.Err(), shutdownErr, fmt.Errorf("runtime cleanup exceeded %s; inspect the execution and recover any uncertain mutation before retrying", grace))
 		}
 	}
-}
-
-// resumeRuntime resumes the whole suspended process, including extra threads created before user code, just as the plugin host does.
-func resumeRuntime(process windows.Handle) error {
-	resume := windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
-	if err := resume.Find(); err != nil {
-		return fmt.Errorf("locating runtime resume procedure: %w", err)
-	}
-	status, _, _ := resume.Call(uintptr(process))
-	if status != 0 {
-		return fmt.Errorf("resuming runtime process: %w", windows.NTStatus(status))
-	}
-	return nil
 }
 
 // runtimeOutput detaches late pipe copies before a bounded shutdown returns buffers to their caller.
