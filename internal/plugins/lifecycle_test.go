@@ -29,10 +29,12 @@ func lifecycleDescriptor() sdk.Descriptor {
 	}
 	return sdk.Descriptor{Name: "lifecycle", Version: "1.0.0", Protocol: sdk.ProtocolVersion, Executable: name, Features: []sdk.Feature{
 		{Name: "trace", Kind: "observer", Effect: "pure", Events: sdk.LifecyclePhases},
-		{Name: "guard", Kind: "gate", Effect: "read_only", Events: []string{"node.plan.ready", "node.mutation.admit"}},
+		{Name: "guard", Kind: "gate", Effect: "read_only", Events: []string{"node.prepare", "node.plan.ready", "node.mutation.admit"}},
+		// Scoped to destroy so apply fixtures keep observer-only level events and overlapping levels.
+		{Name: "level_guard", Kind: "gate", Effect: "read_only", Events: []string{"level.finished"}, Operations: []string{"destroy"}},
 		{Name: "secret", Kind: "input_resolver", Effect: "read_only"},
 		{Name: "auth", Kind: "credential_provider", Effect: "read_only"},
-		{Name: "delivery", Kind: "observer", Effect: "idempotent_external", Events: []string{"node.mutation.finished", "run.finished", "session.close"}},
+		{Name: "delivery", Kind: "observer", Effect: "idempotent_external", Events: []string{"node.mutation.finished", "node.finished", "level.finished", "run.finished", "session.close"}},
 		{Name: "expand_nodes", Kind: "expansion", Effect: "pure"},
 	}}
 }
@@ -53,6 +55,13 @@ func serveLifecycleFixture() {
 		case "observer":
 			if r.Feature == "trace" {
 				sdk.Logger(ctx).Info("lifecycle event", "phase", r.Event.Phase, "node", r.Event.Node, "status", r.Event.Status)
+				// A synchronous file append records host emission order, which asynchronous plugin log forwarding does not guarantee.
+				if path, ok := config["events"].(string); ok {
+					if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+						_, _ = fmt.Fprintf(f, "%s|%s|%s|%s\n", r.Event.Phase, r.Event.Node, r.Event.Status, strings.Join(r.Event.Nodes, ","))
+						_ = f.Close()
+					}
+				}
 				if config["panic_observer"] == true && r.Event.Phase == "node.mutation.finished" {
 					panic("private plugin error")
 				}
@@ -62,7 +71,7 @@ func serveLifecycleFixture() {
 			}
 			return sdk.Response{}, nil
 		case "gate":
-			if config["deny_phase"] == r.Event.Phase {
+			if config["deny_phase"] == r.Event.Phase && (config["deny_node"] == nil || config["deny_node"] == r.Event.Node) {
 				return sdk.Response{Decision: "deny"}, nil
 			}
 			if config["unknown"] == true {
@@ -112,11 +121,27 @@ func runLifecycleTerraform() {
 	if len(args) == 0 {
 		os.Exit(1)
 	}
-	if path := os.Getenv("TG_LIFECYCLE_RUNTIME_LOG"); path != "" {
+	node := filepath.Base(os.Getenv("TF_DATA_DIR"))
+	path := os.Getenv("TG_LIFECYCLE_RUNTIME_LOG")
+	if path != "" {
 		f, _ := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if f != nil {
-			_, _ = fmt.Fprintln(f, args[0])
+			_, _ = fmt.Fprintln(f, args[0], node)
 			_ = f.Close()
+		}
+	}
+	// Holding one node's apply until another node's command appears proves overlap without timing assumptions; an unmet wait fails instead of hanging.
+	if waiter, target, ok := strings.Cut(os.Getenv("TG_LIFECYCLE_WAIT"), ":"); ok && waiter == node && args[0] == "apply" {
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			commands, _ := os.ReadFile(path)
+			if strings.Contains(string(commands), " "+target+"\n") {
+				break
+			}
+			if time.Now().After(deadline) {
+				os.Exit(1)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	switch args[0] {
@@ -634,5 +659,232 @@ func TestLifecycle_SavedApplyTerminalFailureRetainsPlanEvidence(t *testing.T) {
 	}
 	if _, err := os.Stat(planPath); err != nil {
 		t.Fatalf("recovery evidence removed before teardown: %v", err)
+	}
+}
+
+// lifecycleEvents reads the observer's emission log; a missing file means nothing was observed.
+func lifecycleEvents(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimSpace(string(data)), "\n")
+}
+
+func eventIndex(lines []string, prefix string) int {
+	for i, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+func eventCount(lines []string, prefix string) int {
+	n := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+const crossLevelNodes = `node "a" { source = "./module" }
+ node "b" { source = "./module" }
+ node "child" { source = "./module" }
+ node "tail" { source = "./module" }
+ edge {
+ from = node.a
+ to = node.child
+ }
+ edge {
+ from = node.b
+ to = node.tail
+ }`
+
+func TestLifecycle_OverlappingLevelsReportEachTransitionOnce(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, crossLevelNodes)
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", filepath.Join(dir, "runtime.log"))
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:child")
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2})
+	if err != nil {
+		t.Fatalf("got = %v, want child to overlap b", err)
+	}
+	for _, n := range result.Nodes {
+		if n.Status != engine.StatusApplied {
+			t.Fatalf("got = %+v, want every node applied", result.Nodes)
+		}
+	}
+	lines := lifecycleEvents(t, events)
+	for _, node := range []string{"a", "b", "child", "tail"} {
+		if got := eventCount(lines, "node.finished|"+node+"|"); got != 1 {
+			t.Fatalf("node.finished for %s = %d, want 1 in %v", node, got, lines)
+		}
+		if got := eventCount(lines, "node.prepare|"+node+"|"); got != 1 {
+			t.Fatalf("node.prepare for %s = %d, want 1 in %v", node, got, lines)
+		}
+	}
+	if prepared, finished := eventIndex(lines, "node.prepare|child|"), eventIndex(lines, "node.finished|b|"); prepared > finished {
+		t.Fatalf("got = %v, want level-2 child prepared before level-1 b finished", lines)
+	}
+	first, second := eventIndex(lines, "level.finished|||a,b"), eventIndex(lines, "level.finished|||child,tail")
+	if eventCount(lines, "level.finished|") != 2 || first < 0 || second < first {
+		t.Fatalf("got = %v, want each level reported once in level order", lines)
+	}
+	for _, node := range []string{"a", "b"} {
+		if eventIndex(lines, "node.finished|"+node+"|") > first {
+			t.Fatalf("got = %v, want level 1 reported after its nodes finished", lines)
+		}
+	}
+	for _, node := range []string{"child", "tail"} {
+		if eventIndex(lines, "node.finished|"+node+"|") > second {
+			t.Fatalf("got = %v, want level 2 reported after its nodes finished", lines)
+		}
+	}
+}
+
+func TestLifecycle_PrepareDenialStopsBeyondItsLevel(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", deny_phase = "node.prepare", deny_node = "child" }`, crossLevelNodes+`
+ node "last" { source = "./module" }
+ edge {
+ from = node.tail
+ to = node.last
+ }`)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Apply(engine.Options{AutoApprove: true})
+	if err == nil || !strings.Contains(err.Error(), "policy denied node.prepare") {
+		t.Fatalf("got = %v, want node.prepare denial", err)
+	}
+	want := map[string]string{"a": engine.StatusApplied, "b": engine.StatusApplied, "child": engine.StatusNotRun, "tail": engine.StatusApplied, "last": engine.StatusNotRun}
+	for _, n := range result.Nodes {
+		if n.Status != want[n.Node] {
+			t.Fatalf("got = %+v, want queued sibling applied and later level not run", result.Nodes)
+		}
+	}
+	commands, _ := os.ReadFile(logPath)
+	if strings.Contains(string(commands), " child\n") || strings.Contains(string(commands), " last\n") {
+		t.Fatalf("got = %s, want no runtime command for denied or later nodes", commands)
+	}
+	lines := lifecycleEvents(t, events)
+	if eventCount(lines, "node.finished|child|not run|") != 1 || eventCount(lines, "node.finished|last|not run|") != 1 {
+		t.Fatalf("got = %v, want one not-run terminal event for denied and unreached nodes", lines)
+	}
+	if eventCount(lines, "level.finished|") != 2 {
+		t.Fatalf("got = %v, want the failed level reported and the unreached level not", lines)
+	}
+}
+
+func TestLifecycle_RequiredLevelDeliveryFailureStopsNewWork(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", fail_terminal = "level.finished", fail_operation = "apply" }
+ feature "delivery" { mode = "enforce" }`, crossLevelNodes)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:child")
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2})
+	if err == nil || !strings.Contains(err.Error(), "at level.finished") {
+		t.Fatalf("got = %v, want required level delivery failure", err)
+	}
+	want := map[string]string{"a": engine.StatusApplied, "b": engine.StatusApplied, "child": engine.StatusApplied, "tail": engine.StatusNotRun}
+	for _, n := range result.Nodes {
+		if n.Status != want[n.Node] {
+			t.Fatalf("got = %+v, want overlapping child kept and tail not started", result.Nodes)
+		}
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " tail\n") {
+		t.Fatalf("got = %s, want no work after the failed delivery", commands)
+	}
+	lines := lifecycleEvents(t, events)
+	if eventCount(lines, "level.finished|") != 1 || eventCount(lines, "node.finished|tail|not run|") != 1 {
+		t.Fatalf("got = %v, want one level event and a not-run tail", lines)
+	}
+}
+
+func TestLifecycle_LevelGateHoldsReadyWorkUntilDecision(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`", deny_phase = "level.finished" }`, `node "a" { source = "./module" }
+ node "b" { source = "./module" }
+ node "child" { source = "./module" }
+ edge {
+ from = node.a
+ to = node.child
+ }`)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Destroy(engine.Options{AutoApprove: true, Parallelism: 2})
+	if err == nil || !strings.Contains(err.Error(), "policy denied level.finished") {
+		t.Fatalf("got = %v, want level gate denial", err)
+	}
+	for _, n := range result.Nodes {
+		if (n.Node == "child") != (n.Status == engine.StatusDestroyed) {
+			t.Fatalf("got = %+v, want only the gated level destroyed", result.Nodes)
+		}
+	}
+	// b has no consumers, so only the level gate can keep it from starting beside child.
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " b\n") || strings.Contains(string(commands), " a\n") {
+		t.Fatalf("got = %s, want no work beyond the denied level", commands)
+	}
+	if lines := lifecycleEvents(t, events); eventCount(lines, "node.finished|b|not run|") != 1 {
+		t.Fatalf("got = %v, want b reported not run", lines)
+	}
+}
+
+func TestLifecycle_CancellationReportsEveryNodeOnce(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, crossLevelNodes)
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", filepath.Join(dir, "runtime.log"))
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:never")
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.Context = ctx
+	type outcome struct {
+		result engine.RunResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2})
+		done <- outcome{result, err}
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for eventIndex(lifecycleEvents(t, events), "node.finished|child|applied|") < 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("level-2 child never finished beside the running level-1 node")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("cancelled apply did not return")
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("got = %v, want cancellation", got.err)
+	}
+	for _, n := range got.result.Nodes {
+		if n.Node == "tail" && n.Status != engine.StatusNotRun {
+			t.Fatalf("got = %+v, want tail not run", got.result.Nodes)
+		}
+	}
+	lines := lifecycleEvents(t, events)
+	for _, node := range []string{"a", "b", "child", "tail"} {
+		if eventCount(lines, "node.finished|"+node+"|") != 1 {
+			t.Fatalf("got = %v, want one terminal event for %s", lines, node)
+		}
+	}
+	if eventCount(lines, "node.finished|tail|not run|") != 1 || eventCount(lines, "level.finished|") != 0 || eventCount(lines, "run.finished||cancelled|") != 1 {
+		t.Fatalf("got = %v, want not-run tail, no level completion, and a cancelled run", lines)
 	}
 }
