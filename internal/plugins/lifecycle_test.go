@@ -145,6 +145,12 @@ func runLifecycleTerraform() {
 			if strings.Contains(string(commands), want) {
 				break
 			}
+			// Windows keeps native console semantics and does not kill runtimes on cancellation, so a test releases the hold explicitly.
+			if release := os.Getenv("TG_LIFECYCLE_RELEASE"); release != "" {
+				if _, err := os.Stat(release); err == nil {
+					os.Exit(1)
+				}
+			}
 			if time.Now().After(deadline) {
 				os.Exit(1)
 			}
@@ -853,6 +859,8 @@ func TestLifecycle_CancellationReportsEveryNodeOnce(t *testing.T) {
 	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, crossLevelNodes)
 	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", filepath.Join(dir, "runtime.log"))
 	t.Setenv("TG_LIFECYCLE_WAIT", "b:never")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("TG_LIFECYCLE_RELEASE", release)
 	e, _ := loadLifecycleEngine(t, dir, binary)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -876,6 +884,9 @@ func TestLifecycle_CancellationReportsEveryNodeOnce(t *testing.T) {
 		}
 	}
 	cancel()
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case got = <-done:
 	case <-time.After(2 * time.Minute):
