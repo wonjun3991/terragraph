@@ -1111,3 +1111,60 @@ func TestLifecycle_ContinueCannotOverrideRequiredDeliveryFailure(t *testing.T) {
 		t.Fatalf("got = %s, want no later-level work after the failed delivery", commands)
 	}
 }
+
+func TestLifecycle_StopReportsSingleNodeFailedLevel(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, `node "a" { source = "./module" }
+ node "child" { source = "./module" }
+ edge {
+ from = node.a
+ to = node.child
+ }`)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	t.Setenv("TG_LIFECYCLE_FAIL_PLAN", "a")
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	if _, err := e.Apply(engine.Options{AutoApprove: true, FailurePolicy: "stop"}); err == nil {
+		t.Fatal("failed plan accepted")
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " child\n") {
+		t.Fatalf("got = %s, want no work after the stop", commands)
+	}
+	lines := lifecycleEvents(t, events)
+	if eventCount(lines, "level.finished|||a") != 1 || eventCount(lines, "level.finished|") != 1 || eventCount(lines, "node.finished|child|not run|") != 1 {
+		t.Fatalf("got = %v, want the failed level reported once and the unstarted level withheld", lines)
+	}
+}
+
+func TestLifecycle_StopKeepsEarlierLevelThatFinishesLater(t *testing.T) {
+	events := filepath.Join(t.TempDir(), "events")
+	dir, binary := lifecycleFixture(t, `config = { events = "`+filepath.ToSlash(events)+`" }`, crossLevelNodes)
+	logPath := filepath.Join(dir, "runtime.log")
+	t.Setenv("TG_LIFECYCLE_RUNTIME_LOG", logPath)
+	t.Setenv("TG_LIFECYCLE_FAIL_PLAN", "child")
+	// b finishes level 1 only after level-2 child has failed and stopped the run.
+	t.Setenv("TG_LIFECYCLE_WAIT", "b:node.finished|child|")
+	t.Setenv("TG_LIFECYCLE_WAIT_IN", events)
+	e, _ := loadLifecycleEngine(t, dir, binary)
+	result, err := e.Apply(engine.Options{AutoApprove: true, Parallelism: 2, FailurePolicy: "stop"})
+	if err == nil || !strings.Contains(err.Error(), `node "child"`) {
+		t.Fatalf("got = %v, want child failure", err)
+	}
+	want := map[string]string{"a": engine.StatusApplied, "b": engine.StatusApplied, "child": engine.StatusFailed, "tail": engine.StatusNotRun}
+	for _, n := range result.Nodes {
+		if n.Status != want[n.Node] {
+			t.Fatalf("got = %+v, want running b kept and ready tail not started", result.Nodes)
+		}
+	}
+	if commands, _ := os.ReadFile(logPath); strings.Contains(string(commands), " tail\n") {
+		t.Fatalf("got = %s, want no work after the stop", commands)
+	}
+	lines := lifecycleEvents(t, events)
+	first, second := eventIndex(lines, "level.finished|||a,b"), eventIndex(lines, "level.finished|||child,tail")
+	if eventCount(lines, "level.finished|") != 2 || first < 0 || second < first {
+		t.Fatalf("got = %v, want both started levels reported once in level order", lines)
+	}
+	if tail := eventIndex(lines, "node.finished|tail|not run|"); eventCount(lines, "node.finished|tail|") != 1 || tail < 0 || tail > second {
+		t.Fatalf("got = %v, want unstarted tail finished before its level", lines)
+	}
+}

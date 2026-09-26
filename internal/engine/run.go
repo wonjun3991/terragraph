@@ -140,6 +140,8 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 	// A level.finished gate may deny work beyond that level, so its decision must precede any later dispatch; observers and plugin-free runs keep levels overlapping.
 	gated := afterLevel != nil || e.plugins.Has("level.finished")
 	var stopErr error
+	// --on-failure stop freezes dispatch separately from the level-report ceiling, so levels whose nodes already started still report in order instead of vanishing with the failure.
+	stopped, stopCeiling := false, len(levels)+1
 	finish := func(i int, status string, nodeErr error) {
 		done[i] = true
 		runs[i].Status, runs[i].Err = status, nodeErr
@@ -150,11 +152,10 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 				fallback.Code, fallback.Phase, fallback.Remedy = "dependency_not_reached", "schedule", "resolve the failed dependency's diagnostic and rerun; this node starts once it succeeds"
 			}
 			runs[i].Diagnostics = Diagnostics(nodeErr, fallback)
-			if !keepGoing && runs[i].Level < failureLevel {
+			if opts.FailurePolicy == "stop" {
+				stopped = true
+			} else if !keepGoing && runs[i].Level < failureLevel {
 				failureLevel = runs[i].Level
-				if opts.FailurePolicy == "stop" {
-					failureLevel = 0
-				}
 			}
 		}
 	}
@@ -184,13 +185,35 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 		if cancelled := e.context().Err(); cancelled != nil && stopErr == nil {
 			stopErr = cancelled
 		}
+		// Unstarted nodes in a level that will still report are closed now, so their node.finished precedes that level.finished rather than arriving from the return path.
+		if stopped && stopCeiling > len(levels) {
+			stopCeiling = 0
+			for i := range runs {
+				if started[i] || done[i] {
+					stopCeiling = max(stopCeiling, runs[i].Level)
+				}
+			}
+			for i := range runs {
+				if started[i] || done[i] || runs[i].Level > stopCeiling {
+					continue
+				}
+				if e.plugins != nil {
+					ctx, cancel := context.WithTimeout(context.WithoutCancel(e.context()), 5*time.Second)
+					if emitErr := e.plugins.Emit(ctx, sdk.Event{Phase: "node.finished", Node: runs[i].Node, Status: StatusNotRun}); emitErr != nil {
+						e.plugins.AddNodeCompletionError(runs[i].Node, emitErr)
+					}
+					cancel()
+				}
+				finish(i, StatusNotRun, nil)
+			}
+		}
 		// level.finished follows every node.finished of its level and keeps level order even when an overlapping later level completed first; a failed level still reports, levels beyond the boundary never do.
-		for stopErr == nil && nextLevel <= len(levels) && nextLevel <= failureLevel && nextLevel < completionLevel() && levelDone(nextLevel) {
+		for stopErr == nil && nextLevel <= len(levels) && nextLevel <= min(failureLevel, stopCeiling) && nextLevel < completionLevel() && levelDone(nextLevel) {
 			if emitErr := e.plugins.Emit(e.context(), sdk.Event{Phase: "level.finished", Nodes: levels[nextLevel-1]}); emitErr != nil {
 				stopErr = emitErr
 				break
 			}
-			if afterLevel != nil && nextLevel < failureLevel {
+			if afterLevel != nil && nextLevel < failureLevel && !stopped {
 				if hookErr := afterLevel(); hookErr != nil {
 					stopErr = hookErr
 					break
@@ -200,7 +223,7 @@ func (e *Engine) runLevels(opts Options, reverse bool, action nodeAction, afterL
 		}
 		closed := false
 		for i := range runs {
-			if active == opts.parallelism() || stopErr != nil {
+			if active == opts.parallelism() || stopErr != nil || stopped {
 				break
 			}
 			// The boundary is re-read per candidate because closing a blocked node or a running node's delivery can record a failure mid-scan.
