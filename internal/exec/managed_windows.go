@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"syscall"
@@ -29,6 +30,9 @@ func StartManagedProcess(cmd *exec.Cmd) (func(), error) {
 	return func() { _ = windows.CloseHandle(job) }, nil
 }
 
+// errJobAssignment lets each caller name its own remedy, since only timed runtimes can avoid job membership by dropping a flag.
+var errJobAssignment = errors.New("assigning process job")
+
 // newKillOnCloseJob ties every member's lifetime to the owner's handle, so a crashed owner cannot leave the tree running.
 func newKillOnCloseJob() (windows.Handle, error) {
 	job, err := windows.CreateJobObject(nil, nil)
@@ -52,7 +56,7 @@ func assignAndResume(job windows.Handle, pid int, admit func() error) error {
 	}
 	defer func() { _ = windows.CloseHandle(process) }()
 	if err := windows.AssignProcessToJobObject(job, process); err != nil {
-		return fmt.Errorf("assigning process job: %w; remove incompatible host job restrictions", err)
+		return fmt.Errorf("%w: %w; remove incompatible host job restrictions", errJobAssignment, err)
 	}
 	if admit != nil {
 		if err := admit(); err != nil {

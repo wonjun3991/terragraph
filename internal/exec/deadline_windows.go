@@ -41,6 +41,9 @@ func runWithDeadline(ctx context.Context, cmd *exec.Cmd) error {
 		return err
 	}
 	if err := assignAndResume(job, cmd.Process.Pid, ctx.Err); err != nil {
+		if errors.Is(err, errJobAssignment) {
+			err = fmt.Errorf("%w, or omit --node-timeout because untimed runtimes create no job", err)
+		}
 		_ = cmd.Process.Kill()
 		return waitForRuntime(ctx, cmd, job, runtimeCleanupGrace, err)
 	}
